@@ -7,6 +7,7 @@ use nom::combinator::{complete, consumed, cut, eof, fail, map, not, opt, peek, r
 use nom::multi::{many0, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded, tuple};
 
+use crate::expr::CfgCheck;
 use crate::memchr_splitter::{Splitter1, Splitter2, Splitter3};
 use crate::{
     filter, identifier, is_ws, keyword, not_ws, skip_till, str_lit_without_prefix, ws,
@@ -272,7 +273,7 @@ impl<'a> Cond<'a> {
 pub struct CondTest<'a> {
     pub target: Option<Target<'a>>,
     pub expr: WithSpan<'a, Expr<'a>>,
-    pub contains_bool_lit_or_is_defined: bool,
+    pub cfg_check: CfgCheck,
 }
 
 impl<'a> CondTest<'a> {
@@ -289,13 +290,13 @@ impl<'a> CondTest<'a> {
             )),
             ws(|i| Expr::parse(i, s.level.get())),
         )(i)?;
-        let contains_bool_lit_or_is_defined = expr.contains_bool_lit_or_is_defined();
+        let cfg_check = expr.contains_cfg_check();
         Ok((
             i,
             Self {
                 target,
                 expr,
-                contains_bool_lit_or_is_defined,
+                cfg_check,
             },
         ))
     }

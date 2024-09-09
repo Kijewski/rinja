@@ -66,6 +66,21 @@ pub enum Expr<'a> {
     FilterSource,
     IsDefined(&'a str),
     IsNotDefined(&'a str),
+    IsCfg(&'a str, &'a str),
+    IsNotCfg(&'a str, &'a str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct CfgCheck {
+    bool_lit: bool,
+    defined: bool,
+    configuration: bool,
+}
+
+impl CfgCheck {
+    pub fn bool_lit_or_is_defined(self) -> bool {
+        self.bool_lit || self.defined
+    }
 }
 
 impl<'a> Expr<'a> {
@@ -221,8 +236,9 @@ impl<'a> Expr<'a> {
             _ => return Ok((before_keyword, lhs)),
         };
 
-        let (i, rhs) = opt(terminated(opt(keyword("not")), ws(keyword("defined"))))(i)?;
-        let ctor = match rhs {
+        let (i, rhs) = opt(pair(ws(opt(keyword("not"))), |i| Expr::filtered(i, level)))(i)?;
+        let (neg, rhs) = match rhs {
+            Some((neg, rhs)) => (neg.is_some(), rhs),
             None => {
                 return Err(nom::Err::Failure(ErrorContext::new(
                     "expected `defined` or `not defined` after `is`",
@@ -230,25 +246,51 @@ impl<'a> Expr<'a> {
                     start,
                 )));
             }
-            Some(None) => Self::IsDefined,
-            Some(Some(_)) => Self::IsNotDefined,
         };
-        let var_name = match *lhs {
-            Self::Var(var_name) => var_name,
-            Self::Attr(_, _) => {
+
+        let cfg = if *rhs == Expr::Var("defined") {
+            let var_name = match *lhs {
+                Self::Var(var_name) => var_name,
+                Self::Attr(_, _) => {
+                    return Err(nom::Err::Failure(ErrorContext::new(
+                        "`is defined` operator can only be used on variables, not on their fields",
+                        start,
+                    )));
+                }
+                _ => {
+                    return Err(nom::Err::Failure(ErrorContext::new(
+                        "`is defined` operator can only be used on variables",
+                        start,
+                    )));
+                }
+            };
+            match neg {
+                false => Self::IsDefined(var_name),
+                true => Self::IsNotDefined(var_name),
+            }
+        } else {
+            let Expr::Var(lhs) = *lhs else {
                 return Err(nom::Err::Failure(ErrorContext::new(
-                    "`is defined` operator can only be used on variables, not on their fields",
+                    "left-hand side of `is` operator must be identifier",
                     start,
                 )));
-            }
-            _ => {
+            };
+            let Expr::StrLit(StrLit {
+                prefix: None,
+                content,
+            }) = *rhs
+            else {
                 return Err(nom::Err::Failure(ErrorContext::new(
-                    "`is defined` operator can only be used on variables",
+                    "right-hand side of `is` operator must be string",
                     start,
                 )));
+            };
+            match neg {
+                false => Self::IsCfg(lhs, content),
+                true => Self::IsNotCfg(lhs, content),
             }
         };
-        Ok((i, WithSpan::new(ctor(var_name), start)))
+        Ok((i, WithSpan::new(cfg, start)))
     }
 
     fn filtered(i: &'a str, mut level: Level) -> ParseResult<'a, WithSpan<'a, Self>> {
@@ -372,12 +414,21 @@ impl<'a> Expr<'a> {
         map(char_lit, |i| WithSpan::new(Self::CharLit(i), start))(i)
     }
 
-    pub fn contains_bool_lit_or_is_defined(&self) -> bool {
+    pub fn contains_cfg_check(&self) -> CfgCheck {
+        let mut cfg_check = CfgCheck::default();
+        self._contains_cfg_check(&mut cfg_check);
+        cfg_check
+    }
+
+    pub fn _contains_cfg_check(&self, cfg_check: &mut CfgCheck) {
         match self {
-            Self::BoolLit(_) | Self::IsDefined(_) | Self::IsNotDefined(_) => true,
-            Self::Unary(_, expr) | Self::Group(expr) => expr.contains_bool_lit_or_is_defined(),
+            Self::BoolLit(_) => cfg_check.bool_lit = true,
+            Self::IsDefined(_) | Self::IsNotDefined(_) => cfg_check.defined = true,
+            Self::IsCfg(_, _) | Self::IsNotCfg(_, _) => cfg_check.configuration = true,
+            Self::Unary(_, expr) | Self::Group(expr) => expr._contains_cfg_check(cfg_check),
             Self::BinOp("&&" | "||", left, right) => {
-                left.contains_bool_lit_or_is_defined() || right.contains_bool_lit_or_is_defined()
+                left._contains_cfg_check(cfg_check);
+                right._contains_cfg_check(cfg_check);
             }
             Self::NumLit(_, _)
             | Self::StrLit(_)
@@ -396,7 +447,7 @@ impl<'a> Expr<'a> {
             | Self::Tuple(_)
             | Self::Array(_)
             | Self::BinOp(_, _, _)
-            | Self::Path(_) => false,
+            | Self::Path(_) => {}
         }
     }
 }

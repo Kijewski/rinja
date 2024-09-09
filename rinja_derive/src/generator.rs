@@ -428,7 +428,9 @@ impl<'a> Generator<'a> {
             | Expr::Tuple(_)
             | Expr::NamedArgument(_, _)
             | Expr::FilterSource
-            | Expr::As(_, _) => {
+            | Expr::As(_, _)
+            | Expr::IsCfg(_, _)
+            | Expr::IsNotCfg(_, _) => {
                 *only_contains_is_defined = false;
                 (EvaluatedResult::Unknown, WithSpan::new(expr, span))
             }
@@ -1467,8 +1469,24 @@ impl<'a> Generator<'a> {
             Expr::FilterSource => self.visit_filter_source(buf),
             Expr::IsDefined(var_name) => self.visit_is_defined(buf, true, var_name)?,
             Expr::IsNotDefined(var_name) => self.visit_is_defined(buf, false, var_name)?,
+            Expr::IsCfg(check, value) => self.visit_is_cfg(buf, true, check, value)?,
+            Expr::IsNotCfg(check, value) => self.visit_is_cfg(buf, false, check, value)?,
             Expr::As(ref expr, target) => self.visit_as(ctx, buf, expr, target)?,
         })
+    }
+
+    fn visit_is_cfg(
+        &mut self,
+        buf: &mut Buffer,
+        is_enabled: bool,
+        check: &str,
+        value: &str,
+    ) -> Result<DisplayWrap, CompileError> {
+        if !is_enabled {
+            buf.write('!');
+        }
+        buf.write(format_args!("::core::cfg!({check}, {value})"));
+        Ok(DisplayWrap::Unwrapped)
     }
 
     fn visit_is_defined(
@@ -2491,13 +2509,13 @@ impl<'a> Conds<'a> {
             }
             if let Some(CondTest {
                 expr,
-                contains_bool_lit_or_is_defined,
+                cfg_check,
                 ..
             }) = &cond.cond
             {
                 let mut only_contains_is_defined = true;
 
-                let (evaluated_result, cond_expr) = if *contains_bool_lit_or_is_defined {
+                let (evaluated_result, cond_expr) = if cfg_check.bool_lit_or_is_defined() {
                     let (evaluated_result, expr) =
                         generator.evaluate_condition(expr.clone(), &mut only_contains_is_defined);
                     (evaluated_result, Some(expr))
@@ -2746,6 +2764,7 @@ pub(crate) fn is_cacheable(expr: &WithSpan<'_, Expr<'_>>) -> bool {
         Expr::Unary(_, arg) => is_cacheable(arg),
         Expr::BinOp(_, lhs, rhs) => is_cacheable(lhs) && is_cacheable(rhs),
         Expr::IsDefined(_) | Expr::IsNotDefined(_) => true,
+        Expr::IsCfg(_, _) | Expr::IsNotCfg(_, _) => true,
         Expr::Range(_, lhs, rhs) => {
             lhs.as_ref().map_or(true, |v| is_cacheable(v))
                 && rhs.as_ref().map_or(true, |v| is_cacheable(v))
