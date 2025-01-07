@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8" />
+        <title>Counter</title>
+        <script
+            src="https://cdnjs.cloudflare.com/ajax/libs/htmx/2.0.4/htmx.min.js"
+            integrity="sha512-2kIcAizYXhIn8TzUvqzEDZNuDZ+aW7yE/+f1HJHXFjQcGNfv1kqzJSTBRBSlOgp6B/KZsz1K0a3ZTqP9dnxioQ=="
+            crossorigin="anonymous"
+            referrerpolicy="no-referrer"
+        ></script>
+    </head>
+    <body>
+        <h1>Counter</h1>
+        <p>
+            <button type="button" hx-post="/decrement/" hx-target="#current" title="click to subtract 1">-1</button>
+            <button id="current" type="button" hx-post="/reset/" title="click to reset">
+                {%- block current -%}
+                    value = {{ counter }}
+                {%- endblock -%}
+            </button>
+            <button type="button" hx-post="/increment/" hx-target="#current" title="click to add 1">+1</button>
+        </p>
+    </body>
+</html>
