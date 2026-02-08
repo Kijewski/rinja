@@ -10,7 +10,7 @@ use parser::node::{
     Call, Comment, Cond, CondTest, Declare, FilterBlock, If, Include, Let, Lit, Loop, Match,
     Whitespace, Ws,
 };
-use parser::{Expr, Node, Span, Target, WithSpan};
+use parser::{Expr, LetValueOrBlock, Node, Span, Target, WithSpan};
 use proc_macro2::TokenStream;
 use quote::quote_spanned;
 use rustc_hash::FxBuildHasher;
@@ -903,47 +903,25 @@ impl<'a> Generator<'a, '_> {
 
     fn write_let(
         &mut self,
-        ctx: &Context<'_>,
+        ctx: &Context<'a>,
         buf: &mut Buffer,
         l: &'a WithSpan<Let<'_>>,
     ) -> Result<(), CompileError> {
         self.handle_ws(l.ws);
-        let span = ctx.span_for_node(l.span());
 
-        let Some(val) = &l.val else {
-            let file_info = ctx
-                .file_info_of(l.span())
-                .map(|info| format!(" {info}:"))
-                .unwrap_or_default();
-            eprintln!(
-                "⚠️{file_info} `let` tag will stop supporting declaring variables without value. \
-                 Use `create` instead for this case",
-            );
-            self.write_buf_writable(ctx, buf)?;
-            buf.write_token(Token![let], span);
-            if l.is_mutable {
-                buf.write_token(Token![mut], span);
-            }
-            self.visit_target(ctx, buf, false, true, &l.var, span);
-            buf.write_token(Token![;], span);
-            return Ok(());
-        };
-
-        // Handle when this statement creates a new alias of a caller variable (or of another alias),
-        if let Target::Name(dstvar) = l.var
-            && let Expr::Var(srcvar) = ***val
-            && let Some(caller_alias) = self.locals.get_caller(srcvar)
-        {
-            self.locals.insert(
-                Cow::Borrowed(*dstvar),
-                LocalMeta::CallerAlias(caller_alias.clone()),
-            );
-            return Ok(());
+        match &l.val {
+            LetValueOrBlock::Value(val) => self.write_let_value(ctx, buf, l, val),
+            LetValueOrBlock::Block { nodes, ws } => self.write_let_block(ctx, buf, l, nodes, *ws),
         }
+    }
 
-        let mut expr_buf = Buffer::new();
-        self.visit_expr(ctx, &mut expr_buf, val)?;
-
+    fn write_let_target(
+        &mut self,
+        ctx: &Context<'_>,
+        buf: &mut Buffer,
+        l: &'a WithSpan<Let<'_>>,
+        span: proc_macro2::Span,
+    ) -> Result<(), CompileError> {
         let shadowed = self.is_shadowing_variable(ctx, &l.var, l.span())?;
         if shadowed {
             // Need to flush the buffer if the variable is being shadowed,
@@ -961,6 +939,105 @@ impl<'a> Generator<'a, '_> {
         }
 
         self.visit_target(ctx, buf, true, true, &l.var, span);
+        Ok(())
+    }
+
+    fn write_let_block(
+        &mut self,
+        ctx: &Context<'a>,
+        buf: &mut Buffer,
+        l: &'a WithSpan<Let<'_>>,
+        nodes: &'a [Box<Node<'a>>],
+        ws: Ws,
+    ) -> Result<(), CompileError> {
+        let var_let_source = crate::var_let_source();
+
+        self.write_buf_writable(ctx, buf)?;
+        self.flush_ws(l.ws);
+        // FIXME: Handle case for "let" blocks.
+        self.is_in_filter_block += 1;
+        self.write_buf_writable(ctx, buf)?;
+        let span = ctx.span_for_node(l.span());
+
+        // build `FmtCell` that contains the inner block
+        let mut filter_def_buf = Buffer::new();
+        let _size_hint = self.push_locals(|this| {
+            this.prepare_ws(l.ws);
+            let size_hint = this.handle(
+                ctx,
+                nodes,
+                &mut filter_def_buf,
+                AstLevel::Nested,
+                RenderFor::Template,
+            )?;
+            this.flush_ws(ws);
+            this.write_buf_writable(ctx, &mut filter_def_buf)?;
+            Ok(size_hint)
+        })?;
+        let filter_def_buf = filter_def_buf.into_token_stream();
+
+        self.write_let_target(ctx, buf, l, span)?;
+        buf.write_token(Token![=], span);
+
+        let var_writer = crate::var_writer();
+        let filter_def_buf = quote_spanned!(span=>
+            let #var_let_source = askama::helpers::FmtCell::new(
+                |#var_writer: &mut askama::helpers::core::fmt::Formatter<'_>| -> askama::Result<()> {
+                    #filter_def_buf
+                    askama::Result::Ok(())
+                }
+            );
+        );
+
+        // display the `FmtCell`
+        let mut filter_buf = Buffer::new();
+        quote_into!(&mut filter_buf, span, { askama::filters::Safe(&#var_let_source) });
+        let filter_buf = filter_buf.into_token_stream();
+        let escaper = TokenStream::from_str(self.input.escaper).unwrap();
+        let filter_buf = quote_spanned!(span=>
+            (&&askama::filters::AutoEscaper::new(
+                &(#filter_buf), #escaper
+            )).askama_auto_escape()?
+        );
+        quote_into!(buf, span, { {
+            #filter_def_buf
+            let mut __askama_tmp_write = String::new();
+            if askama::helpers::core::write!(&mut __askama_tmp_write, "{}", #filter_buf).is_err() {
+                return #var_let_source.take_err();
+            }
+            __askama_tmp_write
+        }; });
+
+        self.is_in_filter_block -= 1;
+        self.prepare_ws(ws);
+        Ok(())
+    }
+
+    fn write_let_value(
+        &mut self,
+        ctx: &Context<'_>,
+        buf: &mut Buffer,
+        l: &'a WithSpan<Let<'_>>,
+        val: &WithSpan<Box<Expr<'a>>>,
+    ) -> Result<(), CompileError> {
+        let span = ctx.span_for_node(l.span());
+        // Handle when this statement creates a new alias of a caller variable (or of another alias),
+        if let Target::Name(dstvar) = l.var
+            && let Expr::Var(srcvar) = ***val
+            && let Some(caller_alias) = self.locals.get_caller(srcvar)
+        {
+            self.locals.insert(
+                Cow::Borrowed(*dstvar),
+                LocalMeta::CallerAlias(caller_alias.clone()),
+            );
+            return Ok(());
+        }
+
+        let mut expr_buf = Buffer::new();
+        self.visit_expr(ctx, &mut expr_buf, val)?;
+
+        self.write_let_target(ctx, buf, l, span)?;
+
         // If it's not taking the ownership of a local variable or copyable, then we need to add
         // a reference.
         let borrow = !matches!(***val, Expr::Try(..))
