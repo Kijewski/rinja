@@ -79,7 +79,7 @@ impl<'a> Generator<'a, '_> {
             heritage,
             locals,
             self.buf_writable.discard,
-            self.is_in_filter_block,
+            self.is_in_block,
         );
         child.buf_writable = buf_writable;
         let res = callback(&mut child);
@@ -718,7 +718,7 @@ impl<'a> Generator<'a, '_> {
 
         self.write_buf_writable(ctx, buf)?;
         self.flush_ws(filter.ws1);
-        self.is_in_filter_block += 1;
+        self.is_in_block.increase("filter");
         self.write_buf_writable(ctx, buf)?;
         let span = ctx.span_for_node(filter.span());
 
@@ -776,7 +776,7 @@ impl<'a> Generator<'a, '_> {
             }
         } });
 
-        self.is_in_filter_block -= 1;
+        self.is_in_block.decrease();
         self.prepare_ws(filter.ws2);
         Ok(size_hint)
     }
@@ -954,8 +954,7 @@ impl<'a> Generator<'a, '_> {
 
         self.write_buf_writable(ctx, buf)?;
         self.flush_ws(l.ws);
-        // FIXME: Handle case for "let" blocks.
-        self.is_in_filter_block += 1;
+        self.is_in_block.increase("let/set");
         self.write_buf_writable(ctx, buf)?;
         let span = ctx.span_for_node(l.span());
 
@@ -1008,7 +1007,7 @@ impl<'a> Generator<'a, '_> {
             __askama_tmp_write
         }; });
 
-        self.is_in_filter_block -= 1;
+        self.is_in_block.decrease();
         self.prepare_ws(ws);
         Ok(())
     }
@@ -1088,8 +1087,14 @@ impl<'a> Generator<'a, '_> {
         outer: Ws,
         node: Span,
     ) -> Result<usize, CompileError> {
-        if self.is_in_filter_block > 0 {
-            return Err(ctx.generate_error("cannot have a block inside a filter block", node));
+        if self.is_in_block.level > 0 {
+            return Err(ctx.generate_error(
+                format!(
+                    "cannot have a block inside a {} block",
+                    self.is_in_block.block_name
+                ),
+                node,
+            ));
         }
         // Flush preceding whitespace according to the outer WS spec
         self.flush_ws(outer);
