@@ -79,7 +79,7 @@ impl<'a> Generator<'a, '_> {
             heritage,
             locals,
             self.buf_writable.discard,
-            self.is_in_block,
+            self.is_in_filter_block,
         );
         child.buf_writable = buf_writable;
         let res = callback(&mut child);
@@ -118,7 +118,7 @@ impl<'a> Generator<'a, '_> {
                     size_hint += self.write_expr(ctx, buf, ws, val, render_for)?;
                 }
                 Node::Let(ref l) => {
-                    self.write_let(ctx, buf, l)?;
+                    size_hint += self.write_let(ctx, buf, l)?;
                 }
                 Node::Declare(ref c) => {
                     self.write_decl(ctx, buf, c)?;
@@ -190,14 +190,14 @@ impl<'a> Generator<'a, '_> {
                 }
                 Node::Break(ref ws) => {
                     self.handle_ws(**ws);
-                    self.write_buf_writable(ctx, buf)?;
+                    size_hint += self.write_buf_writable(ctx, buf)?;
                     quote_into!(buf, ctx.span_for_node(ws.span()), {
                         break;
                     });
                 }
                 Node::Continue(ref ws) => {
                     self.handle_ws(**ws);
-                    self.write_buf_writable(ctx, buf)?;
+                    size_hint += self.write_buf_writable(ctx, buf)?;
                     quote_into!(buf, ctx.span_for_node(ws.span()), {
                         continue;
                     });
@@ -718,7 +718,7 @@ impl<'a> Generator<'a, '_> {
 
         self.write_buf_writable(ctx, buf)?;
         self.flush_ws(filter.ws1);
-        self.is_in_block.increase("filter");
+        self.is_in_filter_block += 1;
         self.write_buf_writable(ctx, buf)?;
         let span = ctx.span_for_node(filter.span());
 
@@ -776,7 +776,7 @@ impl<'a> Generator<'a, '_> {
             }
         } });
 
-        self.is_in_block.decrease();
+        self.is_in_filter_block -= 1;
         self.prepare_ws(filter.ws2);
         Ok(size_hint)
     }
@@ -906,27 +906,77 @@ impl<'a> Generator<'a, '_> {
         ctx: &Context<'a>,
         buf: &mut Buffer,
         l: &'a WithSpan<Let<'_>>,
-    ) -> Result<(), CompileError> {
-        self.handle_ws(l.ws);
-
-        match &l.val {
-            LetValueOrBlock::Value(val) => self.write_let_value(ctx, buf, l, val),
-            LetValueOrBlock::Block { nodes, ws } => self.write_let_block(ctx, buf, l, nodes, *ws),
+    ) -> Result<usize, CompileError> {
+        enum AssignAs {
+            Value(Buffer),
+            Reference(Buffer),
+            LetBlock(Buffer, usize),
         }
-    }
 
-    fn write_let_target(
-        &mut self,
-        ctx: &Context<'_>,
-        buf: &mut Buffer,
-        l: &'a WithSpan<Let<'_>>,
-        span: proc_macro2::Span,
-    ) -> Result<(), CompileError> {
+        let mut size_hint = 0;
+        let mut expr_buf = Buffer::new();
+        let expr_buf = match &l.val {
+            LetValueOrBlock::Value(val) => {
+                self.handle_ws(l.ws);
+
+                // Handle when this statement creates a new alias of a caller variable (or of another alias),
+                if let Target::Name(dstvar) = l.var
+                    && let Expr::Var(srcvar) = ***val
+                    && let Some(caller_alias) = self.locals.get_caller(srcvar)
+                {
+                    self.locals.insert(
+                        Cow::Borrowed(*dstvar),
+                        LocalMeta::CallerAlias(caller_alias.clone()),
+                    );
+                    return Ok(0);
+                }
+
+                self.visit_expr(ctx, &mut expr_buf, val)?;
+
+                // If it's not taking the ownership of a local variable or copyable, then we need
+                // to add a reference.
+                if !matches!(***val, Expr::Try(..))
+                    && !matches!(***val, Expr::Var(name) if self.locals.get(name).is_some())
+                    && !is_copyable(val)
+                {
+                    AssignAs::Reference(expr_buf)
+                } else {
+                    AssignAs::Value(expr_buf)
+                }
+            }
+            &LetValueOrBlock::Block { ref nodes, ws } => {
+                if !cfg!(feature = "alloc") {
+                    return Err(ctx.generate_error(
+                        "`let` blocks require the `alloc` feature to be enabled",
+                        l.span(),
+                    ));
+                }
+
+                let ws1 = Ws(l.ws.0, ws.0);
+                let ws2 = Ws(ws.1, l.ws.1);
+
+                self.handle_ws(ws1);
+                size_hint += self.write_buf_writable(ctx, buf)?;
+                let mut estimate = self.handle(
+                    ctx,
+                    nodes,
+                    &mut expr_buf,
+                    AstLevel::Nested,
+                    RenderFor::Template,
+                )?;
+                self.handle_ws(ws2);
+                estimate += self.write_buf_writable(ctx, &mut expr_buf)?;
+
+                AssignAs::LetBlock(expr_buf, estimate)
+            }
+        };
+
+        let span = ctx.span_for_node(l.span());
         let shadowed = self.is_shadowing_variable(ctx, &l.var, l.span())?;
-        if shadowed {
+        if shadowed && !matches!(expr_buf, AssignAs::LetBlock(..)) {
             // Need to flush the buffer if the variable is being shadowed,
             // to ensure the old variable is used.
-            self.write_buf_writable(ctx, buf)?;
+            size_hint += self.write_buf_writable(ctx, buf)?;
         }
         if shadowed
             || !matches!(l.var, Target::Name(_))
@@ -939,115 +989,26 @@ impl<'a> Generator<'a, '_> {
         }
 
         self.visit_target(ctx, buf, true, true, &l.var, span);
-        Ok(())
-    }
-
-    fn write_let_block(
-        &mut self,
-        ctx: &Context<'a>,
-        buf: &mut Buffer,
-        l: &'a WithSpan<Let<'_>>,
-        nodes: &'a [Box<Node<'a>>],
-        ws: Ws,
-    ) -> Result<(), CompileError> {
-        let var_let_source = crate::var_let_source();
-
-        self.write_buf_writable(ctx, buf)?;
-        self.flush_ws(l.ws);
-        self.is_in_block.increase("let/set");
-        self.write_buf_writable(ctx, buf)?;
-        let span = ctx.span_for_node(l.span());
-
-        // build `FmtCell` that contains the inner block
-        let mut filter_def_buf = Buffer::new();
-        let _size_hint = self.push_locals(|this| {
-            this.prepare_ws(l.ws);
-            let size_hint = this.handle(
-                ctx,
-                nodes,
-                &mut filter_def_buf,
-                AstLevel::Nested,
-                RenderFor::Template,
-            )?;
-            this.flush_ws(ws);
-            this.write_buf_writable(ctx, &mut filter_def_buf)?;
-            Ok(size_hint)
-        })?;
-        let filter_def_buf = filter_def_buf.into_token_stream();
-
-        self.write_let_target(ctx, buf, l, span)?;
-        buf.write_token(Token![=], span);
-
-        let var_writer = crate::var_writer();
-        let filter_def_buf = quote_spanned!(span=>
-            let #var_let_source = askama::helpers::FmtCell::new(
-                |#var_writer: &mut askama::helpers::core::fmt::Formatter<'_>| -> askama::Result<()> {
-                    #filter_def_buf
-                    askama::Result::Ok(())
+        buf.write_tokens(match expr_buf {
+            AssignAs::Value(expr_buf) => quote_spanned! { span => = #expr_buf; },
+            AssignAs::Reference(expr_buf) => quote_spanned! { span => = &(#expr_buf); },
+            AssignAs::LetBlock(expr_buf, estimate) => {
+                let writer = crate::var_writer();
+                quote_spanned! {
+                    span => = {
+                        let mut #writer = askama::helpers::alloc::string::String::new();
+                        let _ = #writer.try_reserve(#estimate);
+                        {
+                            let #writer = &mut #writer;
+                            #expr_buf
+                        }
+                        #writer
+                    };
                 }
-            );
-        );
-
-        // display the `FmtCell`
-        let mut filter_buf = Buffer::new();
-        quote_into!(&mut filter_buf, span, { askama::filters::Safe(&#var_let_source) });
-        let filter_buf = filter_buf.into_token_stream();
-        let escaper = TokenStream::from_str(self.input.escaper).unwrap();
-        let filter_buf = quote_spanned!(span=>
-            (&&askama::filters::AutoEscaper::new(
-                &(#filter_buf), #escaper
-            )).askama_auto_escape()?
-        );
-        quote_into!(buf, span, { {
-            #filter_def_buf
-            let mut __askama_tmp_write = String::new();
-            if askama::helpers::core::write!(&mut __askama_tmp_write, "{}", #filter_buf).is_err() {
-                return #var_let_source.take_err();
             }
-            __askama_tmp_write
-        }; });
-
-        self.is_in_block.decrease();
-        self.prepare_ws(ws);
-        Ok(())
-    }
-
-    fn write_let_value(
-        &mut self,
-        ctx: &Context<'_>,
-        buf: &mut Buffer,
-        l: &'a WithSpan<Let<'_>>,
-        val: &WithSpan<Box<Expr<'a>>>,
-    ) -> Result<(), CompileError> {
-        let span = ctx.span_for_node(l.span());
-        // Handle when this statement creates a new alias of a caller variable (or of another alias),
-        if let Target::Name(dstvar) = l.var
-            && let Expr::Var(srcvar) = ***val
-            && let Some(caller_alias) = self.locals.get_caller(srcvar)
-        {
-            self.locals.insert(
-                Cow::Borrowed(*dstvar),
-                LocalMeta::CallerAlias(caller_alias.clone()),
-            );
-            return Ok(());
-        }
-
-        let mut expr_buf = Buffer::new();
-        self.visit_expr(ctx, &mut expr_buf, val)?;
-
-        self.write_let_target(ctx, buf, l, span)?;
-
-        // If it's not taking the ownership of a local variable or copyable, then we need to add
-        // a reference.
-        let borrow = !matches!(***val, Expr::Try(..))
-            && !matches!(***val, Expr::Var(name) if self.locals.get(name).is_some())
-            && !is_copyable(val);
-        buf.write_tokens(if borrow {
-            quote_spanned! { span => = &(#expr_buf); }
-        } else {
-            quote_spanned! { span => = #expr_buf; }
         });
-        Ok(())
+
+        Ok(size_hint)
     }
 
     fn write_decl(
@@ -1087,14 +1048,8 @@ impl<'a> Generator<'a, '_> {
         outer: Ws,
         node: Span,
     ) -> Result<usize, CompileError> {
-        if self.is_in_block.level > 0 {
-            return Err(ctx.generate_error(
-                format!(
-                    "cannot have a block inside a {} block",
-                    self.is_in_block.block_name
-                ),
-                node,
-            ));
+        if self.is_in_filter_block > 0 {
+            return Err(ctx.generate_error("cannot have a block inside a filter block", node));
         }
         // Flush preceding whitespace according to the outer WS spec
         self.flush_ws(outer);

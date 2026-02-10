@@ -1576,3 +1576,13 @@ fn test_compound_assignment() {
         compare(&jinja, &expected, &[("limit", "u32")], 6);
     }
 }
+
+#[test]
+fn check_let_blocks() {
+    compare(
+        r#"aa {%- set navigation -%}\n{{b}}: c\t{%- endset -%}\r\n{{ navigation }}"#,
+        r#"TODO"#,
+        &[("b", "u32")],
+        5,
+    );
+}
